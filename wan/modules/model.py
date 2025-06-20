@@ -50,7 +50,7 @@ def rope_params(max_seq_len, dim, theta=10000):
 
 
 @amp.autocast(enabled=False)
-def rope_apply(x, grid_sizes, freqs):
+def rope_apply(x, grid_sizes, freqs, fractal=False):
     n, c = x.size(2), x.size(3) // 2
 
     # split freqs
@@ -69,8 +69,10 @@ def rope_apply(x, grid_sizes, freqs):
             freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ],
-                            dim=-1).reshape(seq_len, 1, -1)
-
+                            dim=-1)
+        if fractal:
+            freqs_i = local_patching(freqs_i.unsqueeze(0), h, w, 8)
+        freqs_i = freqs_i.reshape(seq_len, 1, -1)
         # apply rotary embedding
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
         x_i = torch.cat([x_i, x[i, seq_len:]])
