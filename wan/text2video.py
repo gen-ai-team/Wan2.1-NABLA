@@ -24,6 +24,8 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .modules.model import parallelize_seq_T2V
+from torch.distributed.device_mesh import init_device_mesh
 
 
 class WanT2V:
@@ -86,7 +88,7 @@ class WanT2V:
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         self.model = WanModel.from_pretrained(checkpoint_dir)
         self.model.eval().requires_grad_(False)
-
+        '''
         if use_usp:
             from xfuser.core.distributed import get_sequence_parallel_world_size
 
@@ -101,7 +103,15 @@ class WanT2V:
             self.sp_size = get_sequence_parallel_world_size()
         else:
             self.sp_size = 1
-
+        '''
+        try:
+            world_size = int(os.environ["WORLD_SIZE"])
+        except:
+            world_size = 1
+        if world_size > 1:
+            device_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("tensor_parallel",))
+            self.model = parallelize_seq_T2V(self.model, device_mesh["tensor_parallel"])
+        self.sp_size = 1
         if dist.is_initialized():
             dist.barrier()
         if dit_fsdp:
@@ -121,7 +131,8 @@ class WanT2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 sparse_attention=False):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -157,9 +168,10 @@ class WanT2V:
         """
         # preprocess
         F = frame_num
+        min_crop = 16 if sparse_attention else 1
         target_shape = (self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
-                        size[1] // self.vae_stride[1],
-                        size[0] // self.vae_stride[2])
+                        size[1] // self.vae_stride[1]//min_crop * min_crop,
+                        size[0] // self.vae_stride[2]//min_crop * min_crop)
 
         seq_len = math.ceil((target_shape[2] * target_shape[3]) /
                             (self.patch_size[1] * self.patch_size[2]) *
@@ -227,8 +239,8 @@ class WanT2V:
             # sample videos
             latents = noise
 
-            arg_c = {'context': context, 'seq_len': seq_len}
-            arg_null = {'context': context_null, 'seq_len': seq_len}
+            arg_c = {'context': context, 'seq_len': seq_len, 'sparse_attention': sparse_attention}
+            arg_null = {'context': context_null, 'seq_len': seq_len, 'sparse_attention': sparse_attention}
 
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents

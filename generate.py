@@ -243,7 +243,11 @@ def _parse_args():
         type=float,
         default=5.0,
         help="Classifier free guidance scale.")
-
+    parser.add_argument(
+        "--sparse_attention",
+        action="store_true",
+        default=False,
+        help="Whether to use sparse attention.")
     args = parser.parse_args()
 
     _validate_args(args)
@@ -379,7 +383,8 @@ def generate(args):
             sampling_steps=args.sample_steps,
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
-            offload_model=args.offload_model)
+            offload_model=args.offload_model,
+            sparse_attention=args.sparse_attention)
 
     elif "i2v" in args.task:
         if args.prompt is None:
