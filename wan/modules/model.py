@@ -14,7 +14,7 @@ from torch.distributed.tensor.parallel import (
 )
 from torch.distributed._tensor import Replicate, Shard
 
-from .attention import flash_attention, local_patching, local_merge, nablaT_v2_doc
+from .attention import flash_attention, local_patching, local_merge, nablaT, sta
 from torch.nn.attention.flex_attention import flex_attention
 
 flex = torch.compile(flex_attention, mode="max-autotune-no-cudagraphs", dynamic=True)
@@ -116,6 +116,8 @@ class WanLayerNorm(nn.LayerNorm):
 
 class WanSelfAttention(nn.Module):
 
+    sta_mask = None
+
     def __init__(self,
                  dim,
                  num_heads,
@@ -139,7 +141,7 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs, sparse_attention=False):
+    def forward(self, x, seq_lens, grid_sizes, freqs, sparse_attention=False, sparse_algo="nablaT"):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -163,7 +165,16 @@ class WanSelfAttention(nn.Module):
             T,H,W = grid_sizes.tolist()[0]
             H,W = H//8,W//8 
             seq = torch.tensor([0,T], dtype=torch.int32).to(q_rope.device)
-            block_mask = nablaT_v2_doc(q_rope, k_rope, seq, T, H, W, wT=11, thr=0.4)
+            if sparse_algo == "nablaT":
+                block_mask = nablaT(q_rope, k_rope, seq, T, H, W, wT=11, thr=0.4)
+            elif sparse_algo == "sta_31_40_40":
+                if WanSelfAttention.sta_mask is None:
+                    WanSelfAttention.sta_mask = sta(T, H, W, wT=31, wH=5, wW=5)
+                block_mask = WanSelfAttention.sta_mask
+            elif sparse_algo == "sta_19_24_24":
+                if WanSelfAttention.sta_mask is None:
+                    WanSelfAttention.sta_mask = sta(T, H, W, wT=19, wH=3, wW=3)
+                block_mask = WanSelfAttention.sta_mask
             x = flex(q_rope, 
                      k_rope,              
                 v.transpose(1, 2),
@@ -308,7 +319,8 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
-        sparse_attention=False
+        sparse_attention=False,
+        sparse_algo="nablaT"
     ):
         r"""
         Args:
@@ -326,7 +338,7 @@ class WanAttentionBlock(nn.Module):
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-            freqs, sparse_attention=sparse_attention)
+            freqs, sparse_attention=sparse_attention, sparse_algo=sparse_algo)
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
 
@@ -523,7 +535,8 @@ class WanModel(ModelMixin, ConfigMixin):
         seq_len,
         clip_fea=None,
         y=None,
-        sparse_attention=False
+        sparse_attention=False,
+        sparse_algo="nablaT"
     ):
         r"""
         Forward pass through the diffusion model
@@ -598,7 +611,8 @@ class WanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
-            sparse_attention=sparse_attention)
+            sparse_attention=sparse_attention,
+            sparse_algo=sparse_algo)
         if sparse_attention:
             P = 8
             x = x.reshape(1, T, H, W, -1)

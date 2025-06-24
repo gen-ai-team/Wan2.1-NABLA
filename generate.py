@@ -248,6 +248,11 @@ def _parse_args():
         action="store_true",
         default=False,
         help="Whether to use sparse attention.")
+    parser.add_argument(
+        "--sparse_algo",
+        default="nablaT",
+        choices=["nablaT", "sta_31_40_40", "sta_19_24_24"],
+        help="Sparse attention algorithm.")
     args = parser.parse_args()
 
     _validate_args(args)
@@ -384,7 +389,8 @@ def generate(args):
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
             offload_model=args.offload_model,
-            sparse_attention=args.sparse_attention)
+            sparse_attention=args.sparse_attention,
+            sparse_algo=args.sparse_algo)
 
     elif "i2v" in args.task:
         if args.prompt is None:

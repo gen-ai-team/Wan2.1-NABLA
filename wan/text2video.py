@@ -132,7 +132,8 @@ class WanT2V:
                  n_prompt="",
                  seed=-1,
                  offload_model=True,
-                 sparse_attention=False):
+                 sparse_attention=False,
+                 sparse_algo="nablaT"):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -157,6 +158,10 @@ class WanT2V:
                 Random seed for noise generation. If -1, use random seed.
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
+            sparse_attention (`bool`, *optional*, defaults to False):
+                If True, use sparse attention.
+            sparse_algo (`str`, *optional*, defaults to "nablaT"):
+                Sparse attention algorithm.
 
         Returns:
             torch.Tensor:
@@ -239,10 +244,23 @@ class WanT2V:
             # sample videos
             latents = noise
 
-            arg_c = {'context': context, 'seq_len': seq_len, 'sparse_attention': sparse_attention}
-            arg_null = {'context': context_null, 'seq_len': seq_len, 'sparse_attention': sparse_attention}
+            def set_sparse_attention(t):
+                if not sparse_attention:
+                    return False
+                if not sparse_algo.startswith("sta"):
+                    return True
+                if t < 12:
+                    return False
+                return True
 
-            for _, t in enumerate(tqdm(timesteps)):
+            for i, t in enumerate(tqdm(timesteps)):
+                arg_c = {'context': context, 'seq_len': seq_len,
+                         'sparse_attention': set_sparse_attention(i),
+                         'sparse_algo': sparse_algo}
+                arg_null = {'context': context_null, 'seq_len': seq_len,
+                            'sparse_attention': set_sparse_attention(i),
+                            'sparse_algo': sparse_algo}
+                
                 latent_model_input = latents
                 timestep = [t]
 
