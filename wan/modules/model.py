@@ -7,7 +7,17 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import flash_attention
+from torch.distributed.tensor.parallel import (
+    PrepareModuleInput,
+    PrepareModuleOutput,
+    parallelize_module
+)
+from torch.distributed._tensor import Replicate, Shard
+
+from .attention import flash_attention, local_patching, local_merge, nablaT, sta
+from torch.nn.attention.flex_attention import flex_attention
+
+flex = torch.compile(flex_attention, mode="max-autotune-no-cudagraphs", dynamic=True)
 
 __all__ = ['WanModel']
 
@@ -40,7 +50,7 @@ def rope_params(max_seq_len, dim, theta=10000):
 
 
 @amp.autocast(enabled=False)
-def rope_apply(x, grid_sizes, freqs):
+def rope_apply(x, grid_sizes, freqs, fractal=False):
     n, c = x.size(2), x.size(3) // 2
 
     # split freqs
@@ -59,8 +69,10 @@ def rope_apply(x, grid_sizes, freqs):
             freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ],
-                            dim=-1).reshape(seq_len, 1, -1)
-
+                            dim=-1)
+        if fractal:
+            freqs_i = local_patching(freqs_i.unsqueeze(0), h, w, 8)
+        freqs_i = freqs_i.reshape(seq_len, 1, -1)
         # apply rotary embedding
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
         x_i = torch.cat([x_i, x[i, seq_len:]])
@@ -104,6 +116,8 @@ class WanLayerNorm(nn.LayerNorm):
 
 class WanSelfAttention(nn.Module):
 
+    sta_mask = None
+
     def __init__(self,
                  dim,
                  num_heads,
@@ -127,7 +141,7 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs, sparse_attention=False, sparse_algo="nablaT"):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -135,23 +149,44 @@ class WanSelfAttention(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        b, _, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
         # query, key, value function
         def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
+            q = self.norm_q(self.q(x)).view(b, -1, n, d)
+            k = self.norm_k(self.k(x)).view(b, -1, n, d)
+            v = self.v(x).view(b, -1, n, d)
             return q, k, v
 
         q, k, v = qkv_fn(x)
-
-        x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size)
+        if sparse_attention:
+            q_rope = rope_apply(q, grid_sizes, freqs, fractal=True).to(dtype=torch.bfloat16).transpose(1, 2)
+            k_rope = rope_apply(k, grid_sizes, freqs, fractal=True).to(dtype=torch.bfloat16).transpose(1, 2)
+            T,H,W = grid_sizes.tolist()[0]
+            H,W = H//8,W//8 
+            seq = torch.tensor([0,T], dtype=torch.int32).to(q_rope.device)
+            if sparse_algo == "nablaT":
+                block_mask = nablaT(q_rope, k_rope, seq, T, H, W, wT=11, thr=0.4)
+            elif sparse_algo == "sta_31_40_40":
+                if WanSelfAttention.sta_mask is None:
+                    WanSelfAttention.sta_mask = sta(T, H, W, wT=31, wH=5, wW=5)
+                block_mask = WanSelfAttention.sta_mask
+            elif sparse_algo == "sta_19_24_24":
+                if WanSelfAttention.sta_mask is None:
+                    WanSelfAttention.sta_mask = sta(T, H, W, wT=19, wH=3, wW=3)
+                block_mask = WanSelfAttention.sta_mask
+            x = flex(q_rope, 
+                     k_rope,              
+                v.transpose(1, 2),
+                block_mask=block_mask
+            ).transpose(1, 2)
+        else:
+            x = flash_attention(
+                q=rope_apply(q, grid_sizes, freqs),
+                k=rope_apply(k, grid_sizes, freqs),
+                v=v,
+                k_lens=seq_lens,
+                window_size=self.window_size)
 
         # output
         x = x.flatten(2)
@@ -284,6 +319,8 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        sparse_attention=False,
+        sparse_algo="nablaT"
     ):
         r"""
         Args:
@@ -301,7 +338,7 @@ class WanAttentionBlock(nn.Module):
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-            freqs)
+            freqs, sparse_attention=sparse_attention, sparse_algo=sparse_algo)
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
 
@@ -498,6 +535,8 @@ class WanModel(ModelMixin, ConfigMixin):
         seq_len,
         clip_fea=None,
         y=None,
+        sparse_attention=False,
+        sparse_algo="nablaT"
     ):
         r"""
         Forward pass through the diffusion model
@@ -532,6 +571,8 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        if sparse_attention:
+            T, H, W = x[0].shape[2:5]
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
         x = [u.flatten(2).transpose(1, 2) for u in x]
@@ -569,14 +610,25 @@ class WanModel(ModelMixin, ConfigMixin):
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
-            context_lens=context_lens)
-
+            context_lens=context_lens,
+            sparse_attention=sparse_attention,
+            sparse_algo=sparse_algo)
+        if sparse_attention:
+            P = 8
+            x = x.reshape(1, T, H, W, -1)
+            x = local_patching(x, H, W, P)
+            x = x.reshape(1, H * W * T, -1)
         for block in self.blocks:
             x = block(x, **kwargs)
+        
 
         # head
         x = self.head(x, e)
-
+        if sparse_attention:
+            P = 8
+            x = x.reshape(1, T, (H * W) // (P * P), P * P, -1)
+            x = local_merge(x, H, W, P)
+            x = x.reshape(1, T * H * W, -1)
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
         return [u.float() for u in x]
@@ -629,3 +681,62 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # init output layer
         nn.init.zeros_(self.head.head.weight)
+
+
+def parallelize_seq_T2V(model, tp_mesh):
+    if tp_mesh.size() > 1:
+        for i, block in enumerate(model.blocks):
+            plan = {
+                "self_attn.norm_q": PrepareModuleOutput(
+                    output_layouts=(Shard(1)), desired_output_layouts=(Shard(-1))
+                ),
+                "self_attn.norm_k": PrepareModuleOutput(
+                    output_layouts=(Shard(1)), desired_output_layouts=(Shard(-1))
+                ),
+                "self_attn.v": PrepareModuleOutput(
+                    output_layouts=(Shard(1)), desired_output_layouts=(Shard(-1))
+                ),
+                "self_attn.o": PrepareModuleInput(
+                    input_layouts=(Shard(-1)),
+                    desired_input_layouts=(Shard(1)),
+                    use_local_output=True,
+                ),
+                "cross_attn.norm_q": PrepareModuleOutput(
+                    output_layouts=(Shard(1)), desired_output_layouts=(Shard(-1))
+                ),
+                "cross_attn.norm_k": PrepareModuleOutput(
+                    output_layouts=(Replicate()), desired_output_layouts=(Shard(-1))
+                ),
+                "cross_attn.v": PrepareModuleOutput(
+                    output_layouts=(Replicate()), desired_output_layouts=(Shard(-1))
+                ),
+                "cross_attn.o": PrepareModuleInput(
+                    input_layouts=(Shard(-1)),
+                    desired_input_layouts=(Shard(1)),
+                    use_local_output=True,
+                ),
+            }
+            self_attn = block.self_attn
+            self_attn.num_heads = self_attn.num_heads // tp_mesh.size()
+            cross_attn = block.cross_attn
+            cross_attn.num_heads = cross_attn.num_heads // tp_mesh.size()
+            parallelize_module(block, tp_mesh, plan)
+
+            if i == 0:
+                parallelize_module(
+                    block,
+                    tp_mesh,
+                    PrepareModuleInput(
+                        input_layouts=(Replicate()),
+                        desired_input_layouts=(Shard(1)),
+                        use_local_output=True,
+                    ),
+                )
+
+        plan = {
+            "head": PrepareModuleOutput(
+                output_layouts=(Shard(1)), desired_output_layouts=(Replicate())
+            ),
+        }
+        parallelize_module(model, tp_mesh, plan)
+    return model

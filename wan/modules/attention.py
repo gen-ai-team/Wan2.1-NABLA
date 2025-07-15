@@ -1,6 +1,11 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
 
+from torch import Tensor
+from torch.nn.attention.flex_attention import BlockMask
+from einops import rearrange
+import math
+
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
@@ -177,3 +182,111 @@ def attention(
 
         out = out.transpose(1, 2).contiguous()
         return out
+
+
+def local_patching(x, height, width, group_size):
+    if group_size > 0:
+        x = rearrange(
+            x,
+            "b t (h g1) (w g2) c -> b t (h w) (g1 g2) c",
+            h=height // group_size,
+            w=width // group_size,
+            g1=group_size,
+            g2=group_size,
+        )
+    else:
+        x = rearrange(x, "b c t h w -> b c t (h w)", h=height, w=width)
+    return x
+
+
+def local_merge(x, height, width, group_size):
+    if group_size > 0:
+        x = rearrange(
+            x,
+            "b t (h w) (g1 g2) c -> b t (h g1) (w g2) c ",
+            h=height // group_size,
+            w=width // group_size,
+            g1=group_size,
+            g2=group_size,
+        )
+    else:
+        x = rearrange(x, "b c (h w) -> b c h w", h=height, w=width)
+    return x
+
+@torch.no_grad()
+def sta(T: int, H: int, W: int, wT: int = 3, wH: int = 3, wW: int = 3,
+             device: str = "cuda") -> BlockMask:
+    l = torch.Tensor([T, H, W]).max()
+    r = torch.arange(0, l, 1, dtype=torch.int16, device=device)
+    mat = (r.unsqueeze(1) - r.unsqueeze(0)).abs()
+    sta_t, sta_h, sta_w = mat[:T, :T].flatten(), mat[:H, :H].flatten(), mat[:W, :W].flatten()
+    sta_t = sta_t <= wT // 2
+    sta_h = sta_h <= wH // 2
+    sta_w = sta_w <= wW // 2
+    sta_hw = (sta_h.unsqueeze(1) * sta_w.unsqueeze(0)).reshape(H, H, W, W).transpose(1, 2).flatten()
+    sta = (sta_t.unsqueeze(1) * sta_hw.unsqueeze(0)).reshape(T, T, H*W, H*W).transpose(1, 2)
+    sta = sta.reshape(T*H*W, T*H*W).unsqueeze_(0).unsqueeze_(0)
+
+    # BlockMask creation
+    kv_nb = sta.sum(-1).to(torch.int32)
+    kv_inds = sta.argsort(dim=-1, descending=True).to(torch.int32)
+    return BlockMask.from_kv_blocks(
+        torch.zeros_like(kv_nb),
+        kv_inds,
+        kv_nb,
+        kv_inds,
+        BLOCK_SIZE=64,
+        mask_mod=None
+    )
+
+@torch.no_grad()
+def sta_nabla(T: int, H: int, W: int, wT: int = 3, wH: int = 3, wW: int = 3,
+             device: str = "cuda") -> Tensor:
+    l = torch.Tensor([T, H, W]).max()
+    r = torch.arange(0, l, 1, dtype=torch.int16, device=device)
+    mat = (r.unsqueeze(1) - r.unsqueeze(0)).abs()
+    sta_t, sta_h, sta_w = mat[:T, :T].flatten(), mat[:H, :H].flatten(), mat[:W, :W].flatten()
+    sta_t = sta_t <= wT // 2
+    sta_h = sta_h <= wH // 2
+    sta_w = sta_w <= wW // 2
+    sta_hw = (sta_h.unsqueeze(1) * sta_w.unsqueeze(0)).reshape(H, H, W, W).transpose(1, 2).flatten()
+    sta = (sta_t.unsqueeze(1) * sta_hw.unsqueeze(0)).reshape(T, T, H*W, H*W).transpose(1, 2)
+    return sta.reshape(T*H*W, T*H*W)
+
+@torch.no_grad()
+def nablaT(q: Tensor, k: Tensor, seq: Tensor, T: int, H: int, W: int, wT: int = 3,
+                  wH: int = 3, wW: int = 3, thr: float = 0.9, sta_att =1,
+                  device: str = "cuda") -> BlockMask:
+    # Map estimation
+    B, h, S, D = q.shape
+    qa = q.reshape(B, h, S // 64, 64, D).mean(-2)
+    ka = k.reshape(B, h, S // 64, 64, D).mean(-2).transpose(-2, -1)
+    map = qa @ ka
+
+    d = torch.diff(seq)
+    doc = torch.eye(d.numel(), dtype=torch.bool, device=device).\
+        repeat_interleave(d*H*W, dim=0).repeat_interleave(d*H*W, dim=1)
+    map += doc.log()
+    map = torch.softmax(map / math.sqrt(D), dim=-1)
+
+    # Map binarization
+    vals, inds = map.sort(-1)
+    cvals = vals.cumsum_(-1)
+    mask = (cvals >= 1 - thr).int()
+    mask = mask.gather(-1, inds.argsort(-1))
+    if sta_att > 0:
+        sta = sta_nabla(T, H, W, wT, wH, wW, device=device).unsqueeze_(0).unsqueeze_(0)
+        mask = torch.logical_or(mask, sta)
+    mask = torch.logical_and(mask, doc)
+
+    # BlockMask creation
+    kv_nb = mask.sum(-1).to(torch.int32)
+    kv_inds = mask.argsort(dim=-1, descending=True).to(torch.int32)
+    return BlockMask.from_kv_blocks(
+        torch.zeros_like(kv_nb),
+        kv_inds,
+        kv_nb,
+        kv_inds,
+        BLOCK_SIZE=64,
+        mask_mod=None
+    )
