@@ -116,14 +116,13 @@ class WanLayerNorm(nn.LayerNorm):
 
 class WanSelfAttention(nn.Module):
 
-    sta_mask = None
-
     def __init__(self,
                  dim,
                  num_heads,
                  window_size=(-1, -1),
                  qk_norm=True,
-                 eps=1e-6):
+                 eps=1e-6,
+                 sparse_algo=None):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -132,6 +131,8 @@ class WanSelfAttention(nn.Module):
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
+        self.sparse_algo = sparse_algo
+        self.mask_func = self.construct_mask_func(sparse_algo) if sparse_algo else None
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -141,7 +142,23 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs, sparse_attention=False, sparse_algo="nablaT"):
+    def construct_mask_func(self, sparse_algo):
+        if "_" in sparse_algo:
+            nabla_cfg, sta_cfg = sparse_algo.split("_")
+            thr = float(nabla_cfg.split("-")[-1])
+            wT, wH, wW = [int(cfg) for cfg in sta_cfg.split("-")[1:]]
+            return lambda q, k, seq, T, H, W: nablaT(q, k, seq, T, H, W, thr=thr, wT=wT, wH=wH, wW=wW)
+
+        if "nabla" in sparse_algo:
+            thr = float(sparse_algo.split("-")[-1])
+            return lambda q, k, seq, T, H, W: nablaT(q, k, seq, T, H, W, thr=thr, sta_att=0)
+        elif "sta" in sparse_algo:
+            wT, wH, wW = [int(cfg) for cfg in sparse_algo.split("-")[1:]]
+            return lambda q, k, seq, T, H, W: sta(T, H, W, wT=wT, wH=wH, wW=wW)
+        else:
+            raise ValueError(f"Invalid sparse algorithm: {sparse_algo}")
+
+    def forward(self, x, seq_lens, grid_sizes, freqs, sparse_attention=False):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -165,16 +182,8 @@ class WanSelfAttention(nn.Module):
             T,H,W = grid_sizes.tolist()[0]
             H,W = H//8,W//8 
             seq = torch.tensor([0,T], dtype=torch.int32).to(q_rope.device)
-            if sparse_algo == "nablaT":
-                block_mask = nablaT(q_rope, k_rope, seq, T, H, W, wT=11, thr=0.4)
-            elif sparse_algo == "sta_31_40_40":
-                if WanSelfAttention.sta_mask is None:
-                    WanSelfAttention.sta_mask = sta(T, H, W, wT=31, wH=5, wW=5)
-                block_mask = WanSelfAttention.sta_mask
-            elif sparse_algo == "sta_19_24_24":
-                if WanSelfAttention.sta_mask is None:
-                    WanSelfAttention.sta_mask = sta(T, H, W, wT=19, wH=3, wW=3)
-                block_mask = WanSelfAttention.sta_mask
+            block_mask = self.mask_func(q_rope, k_rope, seq, T, H, W)
+
             x = flex(q_rope, 
                      k_rope,              
                 v.transpose(1, 2),
@@ -280,7 +289,8 @@ class WanAttentionBlock(nn.Module):
                  window_size=(-1, -1),
                  qk_norm=True,
                  cross_attn_norm=False,
-                 eps=1e-6):
+                 eps=1e-6,
+                 sparse_algo=None):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -289,11 +299,12 @@ class WanAttentionBlock(nn.Module):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+        self.sparse_algo = sparse_algo
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
         self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm,
-                                          eps)
+                                          eps, sparse_algo)
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -320,7 +331,6 @@ class WanAttentionBlock(nn.Module):
         context,
         context_lens,
         sparse_attention=False,
-        sparse_algo="nablaT"
     ):
         r"""
         Args:
@@ -337,8 +347,8 @@ class WanAttentionBlock(nn.Module):
 
         # self-attention
         y = self.self_attn(
-            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-            freqs, sparse_attention=sparse_attention, sparse_algo=sparse_algo)
+            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs,
+            sparse_attention=sparse_attention)
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
 
@@ -432,7 +442,8 @@ class WanModel(ModelMixin, ConfigMixin):
                  window_size=(-1, -1),
                  qk_norm=True,
                  cross_attn_norm=True,
-                 eps=1e-6):
+                 eps=1e-6,
+                 sparse_algo=None):
         r"""
         Initialize the diffusion model backbone.
 
@@ -466,7 +477,9 @@ class WanModel(ModelMixin, ConfigMixin):
             cross_attn_norm (`bool`, *optional*, defaults to False):
                 Enable cross-attention normalization
             eps (`float`, *optional*, defaults to 1e-6):
-                Epsilon value for normalization layers
+                Epsilon value for normalization layers,
+            sparse_algo (`str`, *optional*, defaults to None):
+                Sparse attention algorithm, e.g. "nabla-0.5_sta-5-5-11"
         """
 
         super().__init__()
@@ -488,6 +501,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+        self.sparse_algo = sparse_algo
 
         # embeddings
         self.patch_embedding = nn.Conv3d(
@@ -504,7 +518,7 @@ class WanModel(ModelMixin, ConfigMixin):
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
         self.blocks = nn.ModuleList([
             WanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
-                              window_size, qk_norm, cross_attn_norm, eps)
+                              window_size, qk_norm, cross_attn_norm, eps, sparse_algo)
             for _ in range(num_layers)
         ])
 
@@ -536,7 +550,6 @@ class WanModel(ModelMixin, ConfigMixin):
         clip_fea=None,
         y=None,
         sparse_attention=False,
-        sparse_algo="nablaT"
     ):
         r"""
         Forward pass through the diffusion model
@@ -611,8 +624,7 @@ class WanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
-            sparse_attention=sparse_attention,
-            sparse_algo=sparse_algo)
+            sparse_attention=sparse_attention)
         if sparse_attention:
             P = 8
             x = x.reshape(1, T, H, W, -1)

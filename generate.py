@@ -250,8 +250,7 @@ def _parse_args():
         help="Whether to use sparse attention.")
     parser.add_argument(
         "--sparse_algo",
-        default="nablaT",
-        choices=["nablaT", "sta_31_40_40", "sta_19_24_24"],
+        default="nabla-0.7",
         help="Sparse attention algorithm.")
     args = parser.parse_args()
 
@@ -375,6 +374,7 @@ def generate(args):
             dit_fsdp=args.dit_fsdp,
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
+            sparse_algo=args.sparse_algo
         )
 
         logging.info(
@@ -388,9 +388,7 @@ def generate(args):
             sampling_steps=args.sample_steps,
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
-            offload_model=args.offload_model,
-            sparse_attention=args.sparse_attention,
-            sparse_algo=args.sparse_algo)
+            offload_model=args.offload_model)
 
     elif "i2v" in args.task:
         if args.prompt is None:

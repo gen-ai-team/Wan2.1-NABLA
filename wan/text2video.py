@@ -40,6 +40,7 @@ class WanT2V:
         dit_fsdp=False,
         use_usp=False,
         t5_cpu=False,
+        sparse_algo=None,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -61,11 +62,14 @@ class WanT2V:
                 Enable distribution strategy of USP.
             t5_cpu (`bool`, *optional*, defaults to False):
                 Whether to place T5 model on CPU. Only works without t5_fsdp.
+            sparse_algo (`str`, *optional*, defaults to None):
+                Sparse attention algorithm.
         """
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
+        self.sparse_algo = sparse_algo
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
@@ -86,7 +90,7 @@ class WanT2V:
             device=self.device)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
+        self.model = WanModel.from_pretrained(checkpoint_dir, sparse_algo=sparse_algo)
         self.model.eval().requires_grad_(False)
         '''
         if use_usp:
@@ -131,9 +135,7 @@ class WanT2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True,
-                 sparse_attention=False,
-                 sparse_algo="nablaT"):
+                 offload_model=True):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -158,8 +160,6 @@ class WanT2V:
                 Random seed for noise generation. If -1, use random seed.
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
-            sparse_attention (`bool`, *optional*, defaults to False):
-                If True, use sparse attention.
             sparse_algo (`str`, *optional*, defaults to "nablaT"):
                 Sparse attention algorithm.
 
@@ -173,7 +173,7 @@ class WanT2V:
         """
         # preprocess
         F = frame_num
-        min_crop = 16 if sparse_attention else 1
+        min_crop = 16 if self.sparse_algo else 1
         target_shape = (self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
                         size[1] // self.vae_stride[1]//min_crop * min_crop,
                         size[0] // self.vae_stride[2]//min_crop * min_crop)
@@ -245,9 +245,9 @@ class WanT2V:
             latents = noise
 
             def set_sparse_attention(t):
-                if not sparse_attention:
+                if not self.sparse_algo:
                     return False
-                if not sparse_algo.startswith("sta"):
+                if not self.sparse_algo.startswith("sta"):
                     return True
                 if t < 12:
                     return False
@@ -255,11 +255,9 @@ class WanT2V:
 
             for i, t in enumerate(tqdm(timesteps)):
                 arg_c = {'context': context, 'seq_len': seq_len,
-                         'sparse_attention': set_sparse_attention(i),
-                         'sparse_algo': sparse_algo}
+                         'sparse_attention': set_sparse_attention(i)}
                 arg_null = {'context': context_null, 'seq_len': seq_len,
-                            'sparse_attention': set_sparse_attention(i),
-                            'sparse_algo': sparse_algo}
+                            'sparse_attention': set_sparse_attention(i)}
                 
                 latent_model_input = latents
                 timestep = [t]
