@@ -10,9 +10,14 @@
 
 **NABLA** (Neighborhood Adaptive Block-Level Attention) is a dynamic sparse attention mechanism designed to optimize both training and inference in high-resolution video diffusion transformers. The algorithm is demonstrated using [Wan 2.1](https://github.com/gen-ai-team/Wan2.1) project — an advanced open-source text-to-video diffusion model — and significantly enhances its efficiency via sparse attention.
 
+<p align="center">
+    <img src="assets/nabla.jpg" width="600"/>
+<p>
+
 📄 Paper: [arXiv:2507.13546](https://arxiv.org/abs/2507.13546)  
 📁 Code & Models: [github.com/gen-ai-team/Wan2.1-NABLA](https://github.com/gen-ai-team/Wan2.1-NABLA)  
-🔗 Upstream Model: [Wan 2.1 GitHub](https://github.com/Wan-Video/Wan2.1)
+🔗 Upstream Model: [Wan 2.1 GitHub](https://github.com/Wan-Video/Wan2.1)  
+🤗 Finetuned weights: [Wan-NABLA](https://huggingface.co/collections/ai-forever/wan-nabla-6882459cc8b826be2c0ef30e)
 
 ---
 
@@ -42,7 +47,7 @@ Make sure you are using **PyTorch ≥ 2.7** for Flex Attention support.
 ---
 
 ### Usage examples:
-We finetuned Wan2.1 with three configurations:
+We finetuned Wan2.1 with three perdefined configurations. You can download them from HuggingFace ([Wan-NABLA](https://huggingface.co/collections/ai-forever/wan-nabla-6882459cc8b826be2c0ef30e)), then use:
 * NABLA with threshold 0.7
   ```bash
   python generate.py --task t2v-14B --size 1280*720 --ckpt_dir ./Wan2.1-T2V-14B-NABLA-0.7 --prompt {prompt} --frame_num {frame_num}
